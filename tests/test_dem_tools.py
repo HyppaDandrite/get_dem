@@ -244,6 +244,9 @@ class DemTests(unittest.TestCase):
             get.side_effect = d.requests.ConnectionError()
             with self.assertRaisesRegex(RuntimeError, "Cannot download the GA25"):
                 d.get_ga25_map(aoi)
+            get.side_effect = None
+            d.get_geocover_map(aoi)
+            self.assertEqual(get.call_args.kwargs["params"]["LAYERS"], "ch.swisstopo.geologie-geocover")
 
     def test_find_sections_filters_and_sorts(self):
         results = [self.ga25_section(),
@@ -300,7 +303,7 @@ class DemTests(unittest.TestCase):
         section["path"] = self.folder / "plate.pdf"
         section["path"].write_bytes(b"%PDF %%EOF")
         _, _, archive = d.export_outputs(dem, transform, self.folder / "out", geology=geology,
-                                         sections=[section])
+                                         sections=[section], geocover=geology)
         out = self.folder / "out"
         world = list(map(float, (out / "geology_ga25_5m_lv95.pgw").read_text().splitlines()))
         self.assertEqual(world, [5, 0, 0, -5, 2614002.5, 1089197.5])
@@ -313,12 +316,15 @@ class DemTests(unittest.TestCase):
         self.assertIn("II-4  GA25_107_Plate_II_Section_4", notes)
         with ZipFile(archive) as zipped:
             names = set(zipped.namelist())
-        self.assertLessEqual({"geology_ga25_5m_lv95.png", "geology_ga25_5m_lv95.pgw",
+        self.assertIn("layers=ch.swisstopo.geologie-geocover", notes)
+        self.assertLessEqual({"geology_geocover_5m_lv95.png", "geology_geocover_5m_lv95.prj",
+                              "geology_ga25_5m_lv95.png", "geology_ga25_5m_lv95.pgw",
                               "sections_ga25_lv95.csv", "sections_ga25_lv95.geojson",
                               "sections/GA25_107_Plate_II_Section_4.pdf"}, names)
-        self.assertEqual(len(names), 12)
+        self.assertEqual(len(names), 15)
         with patch.object(plt, "show"):
-            d.preview(dem, np.ones((8, 8, 4)), transform, geology, [section])
+            for maps in [(geology, None), (None, geology), (geology, geology), (None, None)]:
+                d.preview(dem, np.ones((8, 8, 4)), transform, maps[0], [section], maps[1])
 
     def test_notebook_structure_and_offline_execution(self):
         notebook = nbformat.read(ROOT / "notebooks/get_dem_25m.ipynb", as_version=4)
@@ -330,25 +336,28 @@ class DemTests(unittest.TestCase):
                 self.assertEqual(c.outputs, [])
                 compile(c.source, "notebook", "exec")
         path = self.tile()
-        for ga25 in [True, False]:
+        for ga25, geocover in [(True, True), (False, True), (True, False), (False, False)]:
             ns = {}
-            with self.subTest(ga25=ga25), redirect_stdout(io.StringIO()), patch.object(plt, "show"):
+            with self.subTest(ga25=ga25, geocover=geocover), redirect_stdout(io.StringIO()), patch.object(plt, "show"):
                 exec(codes[0], ns)
                 self.assertEqual(ns["AOI_LV95"], d.CERVIN)
                 self.assertIs(ns["GA25"], True)
-                ns.update(AOI_LV95=(2614000, 1089000, 2614200, 1089200), GA25=ga25)
+                self.assertIs(ns["GEOCOVER"], True)
+                ns.update(AOI_LV95=(2614000, 1089000, 2614200, 1089200), GA25=ga25, GEOCOVER=geocover)
                 exec(codes[1], ns)
-                ns["OUTPUT"] = self.folder / str(ga25)
+                ns["OUTPUT"] = self.folder / f"{ga25}_{geocover}"
                 ns["find_tiles"] = lambda _: [{"url": "synthetic test"}]
                 ns["download_tiles"] = lambda *_: [path]
                 ns["get_ga25_map"] = lambda _: (np.zeros((40, 40, 4), np.uint8),
                                                 from_origin(2614000, 1089200, 5, 5))
+                ns["get_geocover_map"] = ns["get_ga25_map"]
                 ns["find_sections"] = lambda _: [d._section(self.ga25_section())]
                 ns["download_sections"] = lambda sections, _: sections
                 for source in codes[2:]:
                     exec(source, ns)
                 self.assertTrue(ns["archive"].exists())
                 self.assertEqual((ns["OUTPUT"] / "sections_ga25_lv95.csv").exists(), ga25)
+                self.assertEqual((ns["OUTPUT"] / "geology_geocover_5m_lv95.png").exists(), geocover)
 
 if __name__ == "__main__":
     unittest.main()

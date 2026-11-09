@@ -1,6 +1,6 @@
 """Small, testable helpers for the teaching notebook.
 
-swissALTI3D -> 25 m terrain, plus the GA25 geological map and GA25 cross-sections.
+swissALTI3D -> 25 m terrain, plus the GA25 and GeoCover geological maps and GA25 cross-sections.
 """
 
 from contextlib import ExitStack
@@ -50,6 +50,8 @@ COLLECTION = "ch.swisstopo.swissalti3d"
 WMS = "https://wms.geo.admin.ch/"
 IDENTIFY = "https://api3.geo.admin.ch/rest/services/api/MapServer/identify"
 GA25_MAP = "ch.swisstopo.geologie-geologischer_atlas"            # Geological Atlas 1:25 000
+GEOCOVER_MAP = "ch.swisstopo.geologie-geocover"                  # GeoCover vector data
+MAP_NAMES = {GA25_MAP: "GA25", GEOCOVER_MAP: "GeoCover"}
 GA25_SECTIONS = "ch.swisstopo.geologie-geologischer_atlas_profile"  # its cross-sections
 GEOLOGY_PIXEL = 5  # metres; divides the 25 m cells, so map and terrain share outer edges.
 
@@ -189,15 +191,26 @@ def download_tiles(tiles, cache, progress=print):
 
 
 def get_ga25_map(aoi, pixel=GEOLOGY_PIXEL):
-    """Download the GA25 geological map as RGBA, on the terrain's exact outer edges.
+    """GA25 Geological Atlas 1:25 000 (scanned sheets, with symbols and labels)."""
+    return get_geology_map(aoi, GA25_MAP, pixel)
 
-    Areas the atlas does not cover yet are transparent.
+
+def get_geocover_map(aoi, pixel=GEOLOGY_PIXEL):
+    """GeoCover (harmonised vector geology, clean colours, wider coverage)."""
+    return get_geology_map(aoi, GEOCOVER_MAP, pixel)
+
+
+def get_geology_map(aoi, layer, pixel=GEOLOGY_PIXEL):
+    """Download a geological map as RGBA, on the terrain's exact outer edges.
+
+    Areas the map does not cover yet are transparent.
     """
     from PIL import Image
 
+    name = MAP_NAMES[layer]
     left, bottom, right, top = aligned_bounds(aoi)
     width, height = round((right - left) / pixel), round((top - bottom) / pixel)
-    params = {"SERVICE": "WMS", "REQUEST": "GetMap", "VERSION": "1.3.0", "LAYERS": GA25_MAP,
+    params = {"SERVICE": "WMS", "REQUEST": "GetMap", "VERSION": "1.3.0", "LAYERS": layer,
               "STYLES": "", "CRS": f"EPSG:{EPSG}", "BBOX": f"{left},{bottom},{right},{top}",
               "WIDTH": width, "HEIGHT": height, "FORMAT": "image/png", "TRANSPARENT": "true"}
     try:
@@ -205,14 +218,14 @@ def get_ga25_map(aoi, pixel=GEOLOGY_PIXEL):
             response = session.get(WMS, params=params, timeout=(30, 180))
             response.raise_for_status()
     except requests.RequestException as exc:
-        raise RuntimeError("Cannot download the GA25 geological map. Check internet access and retry.") from exc
+        raise RuntimeError(f"Cannot download the {name} geological map. Check internet access and retry.") from exc
     # The WMS reports errors as XML with status 200, so check the content type.
     if not response.headers.get("Content-Type", "").startswith("image/png"):
         raise RuntimeError("map.geo.admin.ch did not return an image: " + response.text[:300])
     with Image.open(BytesIO(response.content)) as image:
         rgba = np.asarray(image.convert("RGBA"))
     if rgba.shape[:2] != (height, width):
-        raise RuntimeError("The GA25 map has an unexpected size. Retry later.")
+        raise RuntimeError(f"The {name} map has an unexpected size. Retry later.")
     return rgba, from_origin(left, top, pixel, pixel)
 
 
@@ -398,11 +411,32 @@ def _write_sections(sections, csv_path, geojson_path):
         encoding="utf-8")
 
 
-def export_outputs(dem, transform, output, tiles=(), geology=None, sections=()):
+def _export_map(output, layer, geology, crs_wkt, info):
+    """Write one geological map PNG with world/PRJ files; return files and notes."""
+    import matplotlib.pyplot as plt
+
+    rgba, transform = geology
+    name = MAP_NAMES[layer]
+    png = output / f"geology_{name.lower()}_{transform.a:g}m_lv95.png"
+    plt.imsave(png, rgba, origin="upper")
+    _write_world(png.with_suffix(".pgw"), transform)
+    png.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+    height, width = rgba.shape[:2]
+    lines = ["", f"{name} geological map: {png.name}, {transform.a:g} m pixels.",
+             f"Transparent pixels: not covered by {name}.",
+             "Legend: click the map at https://map.geo.admin.ch/#/map?lang=fr"
+             f"&center={(info['XMin'] + info['XMax']) / 2:.0f},{(info['YMin'] + info['YMax']) / 2:.0f}"
+             f"&z=6&layers={layer}",
+             "Corner pixel CENTRES:"]
+    lines += _corner_centres(transform, width, height)
+    return [png, png.with_suffix(".pgw"), png.with_suffix(".prj")], lines
+
+
+def export_outputs(dem, transform, output, tiles=(), geology=None, sections=(), geocover=None):
     """Write ASCII, PNGs, registration files, sections, project notes and one download ZIP.
 
-    `geology` is the (rgba, transform) pair from get_ga25_map; `sections` the
-    list from find_sections / download_sections.
+    `geology` and `geocover` are (rgba, transform) pairs from get_ga25_map and
+    get_geocover_map; `sections` the list from find_sections / download_sections.
     """
     import matplotlib.pyplot as plt
 
@@ -424,13 +458,12 @@ def export_outputs(dem, transform, output, tiles=(), geology=None, sections=()):
     _write_world(png.with_suffix(".pgw"), transform)
     png.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
     files = [asc, asc.with_suffix(".prj"), png, png.with_suffix(".pgw"), png.with_suffix(".prj")]
-    if geology is not None:
-        geo_rgba, geo_transform = geology
-        geo_png = output / f"geology_ga25_{geo_transform.a:g}m_lv95.png"
-        plt.imsave(geo_png, geo_rgba, origin="upper")
-        _write_world(geo_png.with_suffix(".pgw"), geo_transform)
-        geo_png.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
-        files += [geo_png, geo_png.with_suffix(".pgw"), geo_png.with_suffix(".prj")]
+    map_notes = []
+    for layer, geo in [(GA25_MAP, geology), (GEOCOVER_MAP, geocover)]:
+        if geo is not None:
+            map_files, map_lines = _export_map(output, layer, geo, crs_wkt, info)
+            files += map_files
+            map_notes += map_lines
     if sections:
         traces = output / "sections_ga25_lv95.csv"
         _write_sections(sections, traces, traces.with_suffix(".geojson"))
@@ -444,15 +477,7 @@ def export_outputs(dem, transform, output, tiles=(), geology=None, sections=()):
               "X/Y bounds are image OUTER EDGES (same for every PNG). PNG north is at the top.",
               "For pixel control points, use these CENTRES (zero-based column,row):"]
     lines += _corner_centres(transform, width, height)
-    if geology is not None:
-        geo_height, geo_width = geo_rgba.shape[:2]
-        lines += ["", f"GA25 geological map: {geo_png.name}, {geo_transform.a:g} m pixels.",
-                  "Transparent pixels: not covered by the Geological Atlas 1:25 000.",
-                  "Legend: click the map at https://map.geo.admin.ch/#/map?lang=fr"
-                  f"&center={(info['XMin'] + info['XMax']) / 2:.0f},{(info['YMin'] + info['YMax']) / 2:.0f}"
-                  f"&z=6&layers={GA25_MAP}",
-                  "Corner pixel CENTRES:"]
-        lines += _corner_centres(geo_transform, geo_width, geo_height)
+    lines += map_notes
     if sections:
         lines += ["", f"GA25 cross-sections crossing the area: {len(sections)}",
                   "Traces (LV95 vertices): sections_ga25_lv95.csv / .geojson. They may extend",
@@ -462,7 +487,7 @@ def export_outputs(dem, transform, output, tiles=(), geology=None, sections=()):
             lines.append(f"{_section_label(s)}  {s['id']}  ({s['sheet']}, {s['edition']}; "
                          f"vertical exaggeration {s['vert_exag']}; {s['author']})")
             lines.append(f"    from X={x0:.1f}, Y={y0:.1f} to X={x1:.1f}, Y={y1:.1f}")
-    elif sections is not None and geology is not None:
+    elif geology is not None:
         lines += ["", "No GA25 cross-section crosses this area."]
     lines += ["", "Source: Federal Office of Topography swisstopo", "Source tile URLs:"]
     lines += [tile["url"] for tile in tiles]
@@ -479,42 +504,56 @@ def export_outputs(dem, transform, output, tiles=(), geology=None, sections=()):
     return info, rgba, archive
 
 
-def preview(dem, rgba, transform, geology=None, sections=()):
-    """Show elevation, shading and GA25 geology with section traces; exports are untouched."""
+def _geology_panel(ax, rgba, extent, geology, sections, title):
+    """Hillshade, an optional map on top, and labelled cross-section traces."""
     from matplotlib import patheffects
+
+    left, right, bottom, top = extent
+    ax.imshow(rgba, extent=extent, origin="upper", interpolation="nearest")
+    if geology is not None:
+        ax.imshow(geology[0], extent=extent, origin="upper", alpha=0.8)
+    for s in sections:
+        for line in s["lines"]:
+            xs, ys = zip(*line)
+            ax.plot(xs, ys, color="red", lw=1.5)
+        # Label at the first vertex inside the map, else the one nearest its centre.
+        vertices = [v for line in s["lines"] for v in line]
+        inside = [v for v in vertices if left <= v[0] <= right and bottom <= v[1] <= top]
+        cx, cy = (left + right) / 2, (bottom + top) / 2
+        x, y = inside[0] if inside else min(
+            vertices, key=lambda v: (v[0] - cx) ** 2 + (v[1] - cy) ** 2)
+        ax.annotate(_section_label(s), (np.clip(x, left, right), np.clip(y, bottom, top)),
+                    color="red", fontweight="bold",
+                    path_effects=[patheffects.withStroke(linewidth=3, foreground="white")])
+    ax.set_xlim(left, right)
+    ax.set_ylim(bottom, top)
+    ax.set_title(f"{title}, {len(sections)} GA25 cross-section(s) in red")
+
+
+def preview(dem, rgba, transform, geology=None, sections=(), geocover=None):
+    """Show elevation, shading, GA25 and GeoCover maps with section traces; exports are untouched."""
     import matplotlib.pyplot as plt
 
     left, bottom, right, top = array_bounds(*dem.shape, transform)
     extent = (left, right, bottom, top)
-    panels = 3 if geology is not None or sections else 2
-    fig, axes = plt.subplots(1, panels, figsize=(6 * panels, 5), constrained_layout=True)
+    maps = [(title, geo) for title, geo in [("GA25", geology), ("GeoCover", geocover)]
+            if geo is not None]
+    if not maps and sections:
+        maps = [("Hillshade", None)]
+    if len(maps) == 2:
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10), constrained_layout=True)
+        axes = axes.flatten()
+    else:
+        panels = 2 + len(maps)
+        fig, axes = plt.subplots(1, panels, figsize=(6 * panels, 5), constrained_layout=True)
     terrain = axes[0].imshow(np.ma.masked_equal(dem, NODATA), extent=extent,
                              origin="upper", cmap="terrain", interpolation="nearest")
     fig.colorbar(terrain, ax=axes[0], label="Elevation (m, LN02)", shrink=0.8)
     axes[0].set_title("DEM: 25 m cells")
     axes[1].imshow(rgba, extent=extent, origin="upper", interpolation="nearest")
     axes[1].set_title("Hillshade: northwest light")
-    if panels == 3:
-        ax = axes[2]
-        ax.imshow(rgba, extent=extent, origin="upper", interpolation="nearest")
-        if geology is not None:
-            ax.imshow(geology[0], extent=extent, origin="upper", alpha=0.8)
-        for s in sections:
-            for line in s["lines"]:
-                xs, ys = zip(*line)
-                ax.plot(xs, ys, color="red", lw=1.5)
-            # Label at the first vertex inside the map, else the one nearest its centre.
-            vertices = [v for line in s["lines"] for v in line]
-            inside = [v for v in vertices if left <= v[0] <= right and bottom <= v[1] <= top]
-            cx, cy = (left + right) / 2, (bottom + top) / 2
-            x, y = inside[0] if inside else min(
-                vertices, key=lambda v: (v[0] - cx) ** 2 + (v[1] - cy) ** 2)
-            ax.annotate(_section_label(s), (np.clip(x, left, right), np.clip(y, bottom, top)),
-                        color="red", fontweight="bold",
-                        path_effects=[patheffects.withStroke(linewidth=3, foreground="white")])
-        ax.set_xlim(left, right)
-        ax.set_ylim(bottom, top)
-        ax.set_title(f"GA25 geology, {len(sections)} cross-section(s) in red")
+    for ax, (title, geo) in zip(axes[2:], maps):
+        _geology_panel(ax, rgba, extent, geo, sections, title)
     for ax in axes:
         ax.set_xlabel("LV95 easting (m)")
         ax.set_ylabel("LV95 northing (m)")

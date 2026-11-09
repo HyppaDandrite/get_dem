@@ -21,8 +21,8 @@ The ASCII header already contains the grid origin, cell size and dimensions. Sel
 | Empty parts of the terrain | Read the coverage percentage. NoData at coverage boundaries is expected and stays empty. |
 | DEM does not intersect project | Check all project X/Y bounds and CRS; remove default 0–1000 limits. |
 | Terrain invisible / too coarse | Check Z bounds, surface visibility, view extent, vertical scale and import subsampling. The PNG alone does not fix the geometry. |
-| GA25 download fails | map.geo.admin.ch (WMS and identify service) must be reachable; service errors are reported with their message. Set `GA25 = False` to build the terrain alone. |
-| GA25 map partly transparent / no sections | The atlas is not yet published everywhere, and not every sheet has cross-sections crossing a given rectangle. |
+| GA25 download fails | map.geo.admin.ch (WMS and identify service) must be reachable; service errors are reported with their message. Set `GA25 = False` and `GEOCOVER = False` to build the terrain alone. |
+| Geological map partly transparent / no sections | GA25 and GeoCover are not yet published everywhere, and not every sheet has cross-sections crossing a given rectangle. |
 | Image misplaced | Check its registration and north-up orientation; distinguish outer edges from pixel centres. |
 | Files missing on your computer | NOTO files stay on NOTO until you download `output/geomodeller_dem.zip`. |
 
@@ -43,12 +43,12 @@ pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-Tests cover invalid inputs, tile selection, interrupted downloads, corrupt caches, grid averaging, NoData, coordinates, shading, the GA25 map request and errors, cross-section filtering, PDF downloads and the export ZIP. GitHub Actions runs them on Linux and Windows. Live swisstopo access and GeoModeller's GUI are separate integration checks; automated tests do not certify a particular GeoModeller installation.
+Tests cover invalid inputs, tile selection, interrupted downloads, corrupt caches, grid averaging, NoData, coordinates, shading, the GA25 and GeoCover map requests and errors, cross-section filtering, PDF downloads and the export ZIP. GitHub Actions runs them on Linux and Windows. Live swisstopo access and GeoModeller's GUI are separate integration checks; automated tests do not certify a particular GeoModeller installation.
 
 ## Data and limitations
 
 This is an average of **swissALTI3D at 2 m**, not the legacy DHM25 product. Averaging can soften narrow ridges. The latest available edition of each 1 km tile is selected, so acquisition years may differ across the area. NoData is **-9999**; the requested rectangle is not clipped to the national border. Hillshade uses northwest illumination at 45 degrees, without vertical exaggeration; undefined slopes beside data gaps are transparent.
 
-The GA25 map is a rendered WMS image (`ch.swisstopo.geologie-geologischer_atlas`) requested at 5 m pixels on the exact terrain rectangle, so no resampling is needed. It is a picture for draping, not classified unit data. Cross-sections come from `ch.swisstopo.geologie-geologischer_atlas_profile` (map.geo.admin.ch identify service): every section whose trace intersects the rectangle is kept, with its full trace, metadata (sheet, plate, author, vertical exaggeration) and original PDF plate, cached in `data/ga25_sections`. Check the vertical exaggeration in `project_info.txt` before digitising a section.
+The GA25 map is a rendered WMS image (`ch.swisstopo.geologie-geologischer_atlas`) requested at 5 m pixels on the exact terrain rectangle, so no resampling is needed. It is a picture for draping, not classified unit data. GeoCover (`ch.swisstopo.geologie-geocover`) is fetched the same way: harmonised vector geology without the atlas's topographic base, symbols and labels. Cross-sections come from `ch.swisstopo.geologie-geologischer_atlas_profile` (map.geo.admin.ch identify service): every section whose trace intersects the rectangle is kept, with its full trace, metadata (sheet, plate, author, vertical exaggeration) and original PDF plate, cached in `data/ga25_sections`. Check the vertical exaggeration in `project_info.txt` before digitising a section.
 
 Data source: [swissALTI3D, swisstopo](https://www.swisstopo.admin.ch/en/height-model-swissalti3d). Attribution: **Source: Federal Office of Topography swisstopo**. The export records source URLs for traceability. Terrain data and generated outputs are excluded from Git.
