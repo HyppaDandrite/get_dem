@@ -53,6 +53,8 @@ GA25_MAP = "ch.swisstopo.geologie-geologischer_atlas"            # Geological At
 GEOCOVER_MAP = "ch.swisstopo.geologie-geocover"                  # GeoCover vector data
 MAP_NAMES = {GA25_MAP: "GA25", GEOCOVER_MAP: "GeoCover"}
 GA25_SECTIONS = "ch.swisstopo.geologie-geologischer_atlas_profile"  # its cross-sections
+MULTIDIRECTIONAL = ((225, 1), (270, 2), (315, 4), (360, 2))  # (azimuth, weight)
+HILLSHADE_PIXEL = 5  # metres; computed from the 2 m source, not from the 25 m grid.
 GEOLOGY_PIXEL = 5  # metres; divides the 25 m cells, so map and terrain share outer edges.
 
 
@@ -311,8 +313,8 @@ def download_sections(sections, cache, progress=print):
     return sections
 
 
-def create_grid(paths, aoi):
-    """Mosaic at native resolution, then area-average once onto 25 m cells."""
+def _mosaic(paths, aoi):
+    """Merge the 2 m tiles on their native grid, covering the aligned rectangle."""
     left, bottom, right, top = aligned_bounds(aoi)
     if not paths:
         raise ValueError("No source tiles. Run the download step first.")
@@ -330,12 +332,25 @@ def create_grid(paths, aoi):
         mosaic, source_transform = merge(sources, bounds=native_bounds, res=2,
                                           nodata=NODATA, dtype="float32")
     mosaic[~np.isfinite(mosaic)] = NODATA
-    shape = (int((top - bottom) / RESOLUTION), int((right - left) / RESOLUTION))
-    dem = np.full(shape, NODATA, dtype="float32")
-    transform = from_origin(left, top, RESOLUTION, RESOLUTION)
-    reproject(mosaic[0], dem, src_transform=source_transform, src_crs=EPSG,
-              src_nodata=NODATA, dst_transform=transform, dst_crs=EPSG,
-              dst_nodata=NODATA, resampling=Resampling.average)
+    return mosaic[0], source_transform
+
+
+def _average(source, source_transform, aoi, cell, nodata=NODATA):
+    """Area-average a north-up LV95 grid once onto `cell`-metre cells of the rectangle."""
+    left, bottom, right, top = aligned_bounds(aoi)
+    shape = (round((top - bottom) / cell), round((right - left) / cell))
+    result = np.full(shape, nodata, dtype="float32")
+    transform = from_origin(left, top, cell, cell)
+    reproject(source, result, src_transform=source_transform, src_crs=EPSG,
+              src_nodata=nodata, dst_transform=transform, dst_crs=EPSG,
+              dst_nodata=nodata, resampling=Resampling.average)
+    return result, transform
+
+
+def create_grid(paths, aoi):
+    """Mosaic at native resolution, then area-average once onto 25 m cells."""
+    mosaic, source_transform = _mosaic(paths, aoi)
+    dem, transform = _average(mosaic, source_transform, aoi, RESOLUTION)
     valid = np.isfinite(dem) & (dem != NODATA)
     dem[~valid] = NODATA
     if not valid.any():
@@ -343,17 +358,59 @@ def create_grid(paths, aoi):
     return dem, transform
 
 
-def hillshade(dem, transform):
-    """Northwest light at 45 degrees; transparent gaps and undefined slopes."""
+def _gradients(dem, transform):
+    """East and north slopes (dz/dx, dz/dy); NaN at gaps and beside them."""
     z = np.where(np.isfinite(dem) & (dem != NODATA), dem, np.nan).astype(float)
     # Image rows run southwards, so use negative Y spacing for northward slopes.
     dy, dx = np.gradient(z, transform.e, transform.a)
-    azimuth, altitude = np.deg2rad([315, 45])
+    return dx, dy
+
+
+def _illumination(dx, dy, azimuth, altitude):
+    """Cosine of the angle between the surface normal and a light direction (degrees)."""
+    azimuth, altitude = np.deg2rad([azimuth, altitude])
     sx, sy = np.sin(azimuth) * np.cos(altitude), np.cos(azimuth) * np.cos(altitude)
-    light = (-dx * sx - dy * sy + np.sin(altitude)) / np.sqrt(1 + dx**2 + dy**2)
-    alpha = np.isfinite(light) & np.isfinite(z)
+    return (-dx * sx - dy * sy + np.sin(altitude)) / np.sqrt(1 + dx**2 + dy**2)
+
+
+def _shade(dx, dy, multidirectional):
+    if multidirectional:
+        light = sum(w * np.clip(_illumination(dx, dy, az, 45), 0, 1) for az, w in MULTIDIRECTIONAL)
+        light /= sum(w for _, w in MULTIDIRECTIONAL)
+    else:
+        light = _illumination(dx, dy, 315, 45)
+    alpha = np.isfinite(light)
     shade = np.clip(np.nan_to_num(light), 0, 1)
     return np.dstack((shade, shade, shade, alpha.astype(float)))
+
+
+def hillshade(dem, transform, multidirectional=False):
+    """Northwest light at 45 degrees; transparent gaps and undefined slopes.
+
+    `multidirectional` averages lights from west to north (225-360 degrees),
+    weighted towards northwest: shaded slopes keep visible relief.
+    """
+    return _shade(*_gradients(dem, transform), multidirectional)
+
+
+def create_hillshade(paths, aoi, pixel=HILLSHADE_PIXEL, multidirectional=True):
+    """Detailed shaded relief from the 2 m source, on `pixel`-metre cells.
+
+    Slopes are computed on the native 2 m grid, then area-averaged onto the
+    pixels. Averaging heights first would create stripes when the pixel is not
+    a whole number of source cells (2.5 or 5 m from 2 m). The pixel must divide
+    25 m (2.5, 5, 12.5 or 25), so the image has exactly the terrain's outer
+    edges. Returns (rgba, transform).
+    """
+    if not (isinstance(pixel, Real) and not isinstance(pixel, bool) and 2.5 <= pixel <= RESOLUTION
+            and math.isclose(RESOLUTION / pixel, round(RESOLUTION / pixel))):
+        raise ValueError("HILLSHADE_PIXEL must be 2.5, 5, 12.5 or 25 metres.")
+    mosaic, source_transform = _mosaic(paths, aoi)
+    dx, dy = _gradients(mosaic, source_transform)
+    del mosaic
+    dx, transform = _average(dx.astype("float32"), source_transform, aoi, pixel, nodata=np.nan)
+    dy, _ = _average(dy.astype("float32"), source_transform, aoi, pixel, nodata=np.nan)
+    return _shade(dx, dy, multidirectional), transform
 
 
 def grid_info(dem, transform):
@@ -432,11 +489,13 @@ def _export_map(output, layer, geology, crs_wkt, info):
     return [png, png.with_suffix(".pgw"), png.with_suffix(".prj")], lines
 
 
-def export_outputs(dem, transform, output, tiles=(), geology=None, sections=(), geocover=None):
+def export_outputs(dem, transform, output, tiles=(), geology=None, sections=(), geocover=None,
+                   shade=None):
     """Write ASCII, PNGs, registration files, sections, project notes and one download ZIP.
 
     `geology` and `geocover` are (rgba, transform) pairs from get_ga25_map and
-    get_geocover_map; `sections` the list from find_sections / download_sections.
+    get_geocover_map; `sections` the list from find_sections / download_sections;
+    `shade` the (rgba, transform) pair from create_hillshade (default: from the 25 m grid).
     """
     import matplotlib.pyplot as plt
 
@@ -444,7 +503,10 @@ def export_outputs(dem, transform, output, tiles=(), geology=None, sections=(), 
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     asc = output / "dem_25m_lv95.asc"
-    png = output / "hillshade_25m_lv95.png"
+    if shade is None:
+        shade = (hillshade(dem, transform), transform)
+    rgba, shade_transform = shade
+    png = output / f"hillshade_{shade_transform.a:g}m_lv95.png"
     notes = output / "project_info.txt"
     height, width = dem.shape
     # Explicit ASCII writing avoids driver-dependent sidecars and centre/corner ambiguity.
@@ -453,9 +515,8 @@ def export_outputs(dem, transform, output, tiles=(), geology=None, sections=(), 
     np.savetxt(asc, np.where(np.isfinite(dem), dem, NODATA), fmt="%.3f", header=header, comments="")
     crs_wkt = CRS.from_epsg(EPSG).to_wkt(version="WKT1_ESRI")
     asc.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
-    rgba = hillshade(dem, transform)
     plt.imsave(png, rgba, origin="upper")  # Raw pixels; no plot axes or margins.
-    _write_world(png.with_suffix(".pgw"), transform)
+    _write_world(png.with_suffix(".pgw"), shade_transform)
     png.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
     files = [asc, asc.with_suffix(".prj"), png, png.with_suffix(".pgw"), png.with_suffix(".prj")]
     map_notes = []
@@ -475,8 +536,9 @@ def export_outputs(dem, transform, output, tiles=(), geology=None, sections=(), 
               f"Valid terrain coverage: {info['coverage_percent']:.1f}%",
               "Z limits include at least 100 m margin; lower ZMin for deeper geology.",
               "X/Y bounds are image OUTER EDGES (same for every PNG). PNG north is at the top.",
+              f"Hillshade: {png.name}, {shade_transform.a:g} m pixels.",
               "For pixel control points, use these CENTRES (zero-based column,row):"]
-    lines += _corner_centres(transform, width, height)
+    lines += _corner_centres(shade_transform, rgba.shape[1], rgba.shape[0])
     lines += map_notes
     if sections:
         lines += ["", f"GA25 cross-sections crossing the area: {len(sections)}",
@@ -551,7 +613,7 @@ def preview(dem, rgba, transform, geology=None, sections=(), geocover=None):
     fig.colorbar(terrain, ax=axes[0], label="Elevation (m, LN02)", shrink=0.8)
     axes[0].set_title("DEM: 25 m cells")
     axes[1].imshow(rgba, extent=extent, origin="upper", interpolation="nearest")
-    axes[1].set_title("Hillshade: northwest light")
+    axes[1].set_title(f"Hillshade: {(right - left) / rgba.shape[1]:g} m pixels")
     for ax, (title, geo) in zip(axes[2:], maps):
         _geology_panel(ax, rgba, extent, geo, sections, title)
     for ax in axes:

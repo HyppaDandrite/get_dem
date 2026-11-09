@@ -180,6 +180,42 @@ class DemTests(unittest.TestCase):
         self.assertEqual(rgba[2, 3, 3], 0)
         self.assertEqual(rgba[0, 0, 3], 1)
 
+    def test_detailed_hillshade_from_source(self):
+        rows, cols = np.indices((100, 100))
+        path = self.tile(data=2500 + cols * 2.0 - rows * 4.0)  # z = x + 2y (2 m cells)
+        aoi = (2614000, 1089000, 2614200, 1089200)
+        for pixel in [0, 2, 3, 30, "5", True]:
+            with self.subTest(pixel=pixel), self.assertRaisesRegex(ValueError, "HILLSHADE_PIXEL"):
+                d.create_hillshade([path], aoi, pixel)
+        rgba, transform = d.create_hillshade([path], aoi, 2.5, multidirectional=False)
+        self.assertEqual(rgba.shape, (80, 80, 4))
+        self.assertEqual(transform, from_origin(2614000, 1089200, 2.5, 2.5))
+        expected = max(0, (0.5 - 1 + np.sqrt(0.5)) / np.sqrt(6))
+        np.testing.assert_allclose(rgba[2:-2, 2:-2, 0], expected, atol=1e-6)
+        rgba, _ = d.create_hillshade([path], aoi)
+        self.assertEqual(rgba.shape, (40, 40, 4))
+        # Weighted lights from west to north, each clipped at zero, on the same plane.
+        normal = np.array([-1, -2, 1]) / np.sqrt(6)
+        lights = [(np.sin(np.radians(a)) * np.sqrt(.5), np.cos(np.radians(a)) * np.sqrt(.5), np.sqrt(.5))
+                  for a, _ in d.MULTIDIRECTIONAL]
+        weights = [w for _, w in d.MULTIDIRECTIONAL]
+        expected = sum(w * max(0, normal @ light) for w, light in zip(weights, lights)) / sum(weights)
+        np.testing.assert_allclose(rgba[2:-2, 2:-2, 0], expected, atol=1e-6)
+        flat = d.hillshade(np.full((8, 8), 2500), from_origin(0, 200, 25, 25), True)
+        np.testing.assert_allclose(flat[:, :, 0], np.sqrt(0.5))
+
+    def test_export_detailed_hillshade(self):
+        dem = np.full((8, 8), 2500, dtype="float32")
+        transform = from_origin(2614000, 1089200, 25, 25)
+        shade = (np.ones((40, 40, 4)), from_origin(2614000, 1089200, 5, 5))
+        info, rgba, archive = d.export_outputs(dem, transform, self.folder, shade=shade)
+        self.assertEqual(rgba.shape, (40, 40, 4))
+        world = list(map(float, (self.folder / "hillshade_5m_lv95.pgw").read_text().splitlines()))
+        self.assertEqual(world, [5, 0, 0, -5, 2614002.5, 1089197.5])
+        self.assertIn("Upper right: pixel (39, 0), X=2614197.50", (self.folder / "project_info.txt").read_text())
+        with ZipFile(archive) as zipped:
+            self.assertIn("hillshade_5m_lv95.png", zipped.namelist())
+
     def test_export_roundtrip_and_zip(self):
         dem = np.arange(64, dtype="float32").reshape(8, 8) + 2500.123
         dem[2:4, 2:4] = d.NODATA
@@ -343,6 +379,7 @@ class DemTests(unittest.TestCase):
                 self.assertEqual(ns["AOI_LV95"], d.CERVIN)
                 self.assertIs(ns["GA25"], True)
                 self.assertIs(ns["GEOCOVER"], True)
+                self.assertEqual(ns["HILLSHADE_PIXEL"], 5)
                 ns.update(AOI_LV95=(2614000, 1089000, 2614200, 1089200), GA25=ga25, GEOCOVER=geocover)
                 exec(codes[1], ns)
                 ns["OUTPUT"] = self.folder / f"{ga25}_{geocover}"
@@ -358,6 +395,7 @@ class DemTests(unittest.TestCase):
                 self.assertTrue(ns["archive"].exists())
                 self.assertEqual((ns["OUTPUT"] / "sections_ga25_lv95.csv").exists(), ga25)
                 self.assertEqual((ns["OUTPUT"] / "geology_geocover_5m_lv95.png").exists(), geocover)
+                self.assertEqual(plt.imread(ns["OUTPUT"] / "hillshade_5m_lv95.png").shape, (40, 40, 4))
 
 if __name__ == "__main__":
     unittest.main()

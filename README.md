@@ -31,7 +31,7 @@ Wait until the commands finish. **Do this step only the first time.** On subsequ
 2. Click **Run → Run All Cells**.
 3. Wait until the terrain, hillshade, GA25 and GeoCover previews appear at the bottom.
 
-To use another area, change only the rectangle in the cell labelled **EDIT HERE**, then run all cells again. Enter `(xmin, ymin, xmax, ymax)` in LV95 metres, with each side between 100 m and 10 km. Set `GA25 = False` to skip the atlas map and cross-sections, or `GEOCOVER = False` to skip the GeoCover map.
+To use another area, change only the rectangle in the cell labelled **EDIT HERE**, then run all cells again. Enter `(xmin, ymin, xmax, ymax)` in LV95 metres, with each side between 100 m and 10 km. `HILLSHADE_PIXEL` sets the shaded relief detail: 5 m by default, 2.5 m for maximum detail. Set `GA25 = False` to skip the atlas map and cross-sections, or `GEOCOVER = False` to skip the GeoCover map.
 
 ## 4. Download your files
 
@@ -45,7 +45,7 @@ Use these files for the following steps:
 | --- | --- |
 | `project_info.txt` | Open it to read the project limits and image coordinates. |
 | `dem_25m_lv95.asc` | Import it as the terrain. |
-| `hillshade_25m_lv95.png` | Add it as the shaded relief image. |
+| `hillshade_5m_lv95.png` | Add it as the shaded relief image (5 m detail, from the 2 m source). |
 | `geology_ga25_5m_lv95.png` | Add it as the GA25 geological map image (5 m pixels). |
 | `geology_geocover_5m_lv95.png` | Add it as the GeoCover geological map image (5 m pixels; clean colours, often wider coverage than GA25). |
 | `sections_ga25_lv95.csv` | LV95 vertices of each GA25 cross-section trace, to place sections in GeoModeller. |
@@ -63,7 +63,7 @@ Use these files for the following steps:
 ## 6. Add the shaded relief and geological maps
 
 1. Open **Image Manager** for **SurfaceTopography**.
-2. Add **hillshade_25m_lv95.png**, **geology_ga25_5m_lv95.png** and/or **geology_geocover_5m_lv95.png**.
+2. Add **hillshade_5m_lv95.png**, **geology_ga25_5m_lv95.png** and/or **geology_geocover_5m_lv95.png**.
 3. Position each image using the coordinates in **project_info.txt**: all images have the same **outer edges**; their **corner pixel centres** differ because their pixel sizes differ.
 4. Enable the image display.
 
