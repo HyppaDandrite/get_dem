@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stdout
 import io
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -203,6 +204,122 @@ class DemTests(unittest.TestCase):
             self.assertFalse(any(name.endswith(".tif") for name in zipped.namelist()))
         self.assertFalse((self.folder / "dem_25m_lv95.tif").exists())
 
+    def ga25_section(self, feature_id="GA25_107_Plate_II_Section_4",
+                     host="api3.geo.admin.ch", geometry=None):
+        match = re.search(r"Plate_(\w+?)_Section_(\d+)", feature_id)
+        plate, number = match.groups() if match else ("I", "1")
+        return {"id": feature_id, "geometry": geometry or {"type": "MultiLineString",
+                "coordinates": [[[2614050, 1089050], [2614150, 1089150]]]},
+                "properties": {"ga25_no": 107, "ga25_name": "Matterhorn (LK 1347)", "plate_no": plate,
+                               "section_no": number, "section_type_en": "Geological", "vert_exag": 1.0,
+                               "author": "K. Bucher", "ga25_edition": 2004,
+                               "link_original": f"https://{host}/profile/{feature_id}.pdf"}}
+
+    def response(self, content=b"", content_type="application/json", payload=None):
+        return SimpleNamespace(content=content, text=content.decode("latin-1"),
+                               headers={"Content-Type": content_type},
+                               raise_for_status=lambda: None, json=lambda: payload)
+
+    def test_ga25_map_on_terrain_edges(self):
+        from PIL import Image
+        stream = io.BytesIO()
+        Image.new("RGBA", (40, 40), (10, 20, 30, 255)).save(stream, "PNG")
+        aoi = (2614001, 1089001, 2614200, 1089200)
+        with patch.object(d.requests, "Session") as session:
+            get = session.return_value.__enter__.return_value.get
+            get.return_value = self.response(stream.getvalue(), "image/png")
+            rgba, transform = d.get_ga25_map(aoi)
+            params = get.call_args.kwargs["params"]
+            self.assertEqual(params["LAYERS"], "ch.swisstopo.geologie-geologischer_atlas")
+            self.assertEqual(params["BBOX"], "2614000,1089000,2614200,1089200")
+            self.assertEqual((params["WIDTH"], params["HEIGHT"]), (40, 40))
+            self.assertEqual(rgba.shape, (40, 40, 4))
+            self.assertEqual(transform, from_origin(2614000, 1089200, 5, 5))
+            get.return_value = self.response(b"<ServiceException/>", "text/xml")
+            with self.assertRaisesRegex(RuntimeError, "did not return an image"):
+                d.get_ga25_map(aoi)
+            get.return_value = self.response(stream.getvalue(), "image/png")
+            with self.assertRaisesRegex(RuntimeError, "unexpected size"):
+                d.get_ga25_map((2614000, 1089000, 2614300, 1089200))
+            get.side_effect = d.requests.ConnectionError()
+            with self.assertRaisesRegex(RuntimeError, "Cannot download the GA25"):
+                d.get_ga25_map(aoi)
+
+    def test_find_sections_filters_and_sorts(self):
+        results = [self.ga25_section(),
+                   self.ga25_section("GA25_107_Plate_I_Section_1",
+                                     geometry={"type": "LineString",
+                                               "coordinates": [[2614000, 1089000], [2614100, 1089100]]}),
+                   self.ga25_section("GA25_1_Plate_I_Section_9", host="example.com"),
+                   self.ga25_section("../escape"),
+                   self.ga25_section("GA25_2_Plate_I_Section_2",
+                                     geometry={"type": "Point", "coordinates": [2614000, 1089000]})]
+        with patch.object(d.requests, "Session") as session:
+            get = session.return_value.__enter__.return_value.get
+            get.return_value = self.response(payload={"results": results})
+            sections = d.find_sections(d.CERVIN)
+            self.assertEqual(get.call_args.kwargs["params"]["layers"],
+                             "all:ch.swisstopo.geologie-geologischer_atlas_profile")
+            self.assertEqual([s["id"] for s in sections],
+                             ["GA25_107_Plate_I_Section_1", "GA25_107_Plate_II_Section_4"])
+            self.assertEqual(sections[0]["lines"], [[(2614000.0, 1089000.0), (2614100.0, 1089100.0)]])
+            with self.assertRaisesRegex(RuntimeError, "Too many"):
+                d.find_sections(d.CERVIN, limit=2)
+            get.side_effect = d.requests.ConnectionError()
+            with self.assertRaisesRegex(RuntimeError, "sections service"):
+                d.find_sections(d.CERVIN)
+
+    def test_section_pdf_download_and_reuse(self):
+        section = d._section(self.ga25_section())
+        pdf = b"%PDF-1.4 plate %%EOF\n"
+        cache = self.folder / "sections"
+        cache.mkdir()
+        (cache / f"{section['id']}.pdf").write_bytes(b"%PDF truncated")
+        with patch.object(d.requests, "Session") as session:
+            response = session.return_value.__enter__.return_value.get.return_value.__enter__.return_value
+            response.iter_content.return_value = [pdf]
+            d.download_sections([section], cache, progress=lambda _: None)
+        self.assertEqual(section["path"].read_bytes(), pdf)
+        with patch.object(d.requests, "Session") as session:
+            d.download_sections([section], cache, progress=lambda _: None)
+            session.return_value.__enter__.return_value.get.assert_not_called()
+        with patch.object(d.requests, "Session") as session:
+            response = session.return_value.__enter__.return_value.get.return_value.__enter__.return_value
+            response.iter_content.return_value = [b"<html>not found</html>"]
+            other = d._section(self.ga25_section("GA25_107_Plate_II_Section_5"))
+            with self.assertRaisesRegex(RuntimeError, "Could not download"):
+                d.download_sections([other], cache, progress=lambda _: None)
+        self.assertFalse(list(cache.glob("*.part")))
+        self.assertFalse((cache / "GA25_107_Plate_II_Section_5.pdf").exists())
+
+    def test_export_with_ga25_map_and_sections(self):
+        dem = np.full((8, 8), 2500, dtype="float32")
+        transform = from_origin(2614000, 1089200, 25, 25)
+        geology = (np.full((40, 40, 4), 200, dtype=np.uint8), from_origin(2614000, 1089200, 5, 5))
+        section = d._section(self.ga25_section())
+        section["path"] = self.folder / "plate.pdf"
+        section["path"].write_bytes(b"%PDF %%EOF")
+        _, _, archive = d.export_outputs(dem, transform, self.folder / "out", geology=geology,
+                                         sections=[section])
+        out = self.folder / "out"
+        world = list(map(float, (out / "geology_ga25_5m_lv95.pgw").read_text().splitlines()))
+        self.assertEqual(world, [5, 0, 0, -5, 2614002.5, 1089197.5])
+        self.assertEqual(plt.imread(out / "geology_ga25_5m_lv95.png").shape, (40, 40, 4))
+        rows = (out / "sections_ga25_lv95.csv").read_text().splitlines()
+        self.assertEqual(rows[1], "GA25_107_Plate_II_Section_4,II-4,0,0,2614050.00,1089050.00")
+        geojson = d.json.loads((out / "sections_ga25_lv95.geojson").read_text())
+        self.assertEqual(geojson["features"][0]["geometry"]["type"], "MultiLineString")
+        notes = (out / "project_info.txt").read_text()
+        self.assertIn("II-4  GA25_107_Plate_II_Section_4", notes)
+        with ZipFile(archive) as zipped:
+            names = set(zipped.namelist())
+        self.assertLessEqual({"geology_ga25_5m_lv95.png", "geology_ga25_5m_lv95.pgw",
+                              "sections_ga25_lv95.csv", "sections_ga25_lv95.geojson",
+                              "sections/GA25_107_Plate_II_Section_4.pdf"}, names)
+        self.assertEqual(len(names), 12)
+        with patch.object(plt, "show"):
+            d.preview(dem, np.ones((8, 8, 4)), transform, geology, [section])
+
     def test_notebook_structure_and_offline_execution(self):
         notebook = nbformat.read(ROOT / "notebooks/get_dem_25m.ipynb", as_version=4)
         nbformat.validate(notebook)
@@ -213,19 +330,25 @@ class DemTests(unittest.TestCase):
                 self.assertEqual(c.outputs, [])
                 compile(c.source, "notebook", "exec")
         path = self.tile()
-        ns = {}
-        with redirect_stdout(io.StringIO()), patch.object(plt, "show"):
-            exec(codes[0], ns)
-            self.assertEqual(ns["AOI_LV95"], d.CERVIN)
-            ns["AOI_LV95"] = (2614000, 1089000, 2614200, 1089200)
-            exec(codes[1], ns)
-            ns["OUTPUT"] = self.folder
-            ns["find_tiles"] = lambda _: [{"url": "synthetic test"}]
-            ns["download_tiles"] = lambda *_: [path]
-            for source in codes[2:]:
-                exec(source, ns)
-            self.assertTrue(ns["archive"].exists())
-
+        for ga25 in [True, False]:
+            ns = {}
+            with self.subTest(ga25=ga25), redirect_stdout(io.StringIO()), patch.object(plt, "show"):
+                exec(codes[0], ns)
+                self.assertEqual(ns["AOI_LV95"], d.CERVIN)
+                self.assertIs(ns["GA25"], True)
+                ns.update(AOI_LV95=(2614000, 1089000, 2614200, 1089200), GA25=ga25)
+                exec(codes[1], ns)
+                ns["OUTPUT"] = self.folder / str(ga25)
+                ns["find_tiles"] = lambda _: [{"url": "synthetic test"}]
+                ns["download_tiles"] = lambda *_: [path]
+                ns["get_ga25_map"] = lambda _: (np.zeros((40, 40, 4), np.uint8),
+                                                from_origin(2614000, 1089200, 5, 5))
+                ns["find_sections"] = lambda _: [d._section(self.ga25_section())]
+                ns["download_sections"] = lambda sections, _: sections
+                for source in codes[2:]:
+                    exec(source, ns)
+                self.assertTrue(ns["archive"].exists())
+                self.assertEqual((ns["OUTPUT"] / "sections_ga25_lv95.csv").exists(), ga25)
 
 if __name__ == "__main__":
     unittest.main()

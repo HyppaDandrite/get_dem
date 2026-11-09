@@ -1,6 +1,6 @@
-# A terrain model for GeoModeller
+# A terrain model and GA25 geology for GeoModeller
 
-Follow these steps to prepare the **Cervin / Matterhorn terrain at 25 m resolution** using [EPFL NOTO](https://noto.epfl.ch).
+Follow these steps to prepare the **Cervin / Matterhorn terrain at 25 m resolution**, with the **Geological Atlas of Switzerland 1:25 000 (GA25)** map and its **cross-sections**, using [EPFL NOTO](https://noto.epfl.ch).
 
 ## 1. Open the project in NOTO
 
@@ -29,9 +29,9 @@ Wait until the commands finish. **Do this step only the first time.** On subsequ
 
 1. Keep the first code cell unchanged to use the Cervin example.
 2. Click **Run → Run All Cells**.
-3. Wait until the terrain and hillshade previews appear at the bottom.
+3. Wait until the terrain, hillshade and GA25 previews appear at the bottom.
 
-To use another area, change only the rectangle in the cell labelled **EDIT HERE**, then run all cells again. Enter `(xmin, ymin, xmax, ymax)` in LV95 metres, with each side between 100 m and 10 km.
+To use another area, change only the rectangle in the cell labelled **EDIT HERE**, then run all cells again. Enter `(xmin, ymin, xmax, ymax)` in LV95 metres, with each side between 100 m and 10 km. Set `GA25 = False` to skip the geological map and cross-sections.
 
 ## 4. Download your files
 
@@ -39,13 +39,16 @@ To use another area, change only the rectangle in the cell labelled **EDIT HERE*
 2. Right-click **geomodeller_dem.zip** and select **Download**.
 3. Extract the ZIP on the computer where you will use GeoModeller.
 
-Use these three files for the following steps:
+Use these files for the following steps:
 
 | File | What to do with it |
 | --- | --- |
 | `project_info.txt` | Open it to read the project limits and image coordinates. |
 | `dem_25m_lv95.asc` | Import it as the terrain. |
 | `hillshade_25m_lv95.png` | Add it as the shaded relief image. |
+| `geology_ga25_5m_lv95.png` | Add it as the GA25 geological map image (5 m pixels). |
+| `sections_ga25_lv95.csv` | LV95 vertices of each GA25 cross-section trace, to place sections in GeoModeller. |
+| `sections/*.pdf` | The original GA25 cross-section plates, to read while you build the model. |
 
 ## 5. Import the terrain into GeoModeller
 
@@ -56,12 +59,14 @@ Use these three files for the following steps:
 5. Check that the cell size is **25 m** and retain the full grid when choosing subsampling.
 6. Confirm the import, enable **SurfaceTopography**, and fit the 3D view to the terrain.
 
-## 6. Add the shaded relief image
+## 6. Add the shaded relief and GA25 map
 
 1. Open **Image Manager** for **SurfaceTopography**.
-2. Add **hillshade_25m_lv95.png**.
-3. Position the image using the coordinates in **project_info.txt**: use **outer edges** for an image extent, or **corner pixel centres** for control points.
+2. Add **hillshade_25m_lv95.png** and/or **geology_ga25_5m_lv95.png**.
+3. Position each image using the coordinates in **project_info.txt**: both images have the same **outer edges**; their **corner pixel centres** differ because their pixel sizes differ.
 4. Enable the image display.
+
+To read the GA25 legend, open the map.geo.admin.ch link in **project_info.txt** and click on the map. In the preview and in `project_info.txt`, cross-sections are labelled plate-section, for example `II-4` = plate II, section 4 of the PDF.
 
 If a control or coordinate-system option differs in your GeoModeller version, ask the teaching staff before continuing.
 
@@ -71,4 +76,4 @@ You may use another Python/Jupyter setup. The dependencies are listed in `requir
 
 [Notes for teaching staff](docs/NOTES.md)
 
-Data: **Source: Federal Office of Topography swisstopo**, [swissALTI3D](https://www.swisstopo.admin.ch/en/height-model-swissalti3d).
+Data: **Source: Federal Office of Topography swisstopo**, [swissALTI3D](https://www.swisstopo.admin.ch/en/height-model-swissalti3d), [Geological Atlas of Switzerland 1:25 000](https://map.geo.admin.ch/#/map?layers=ch.swisstopo.geologie-geologischer_atlas) and [GA25 cross-sections](https://map.geo.admin.ch/#/map?layers=ch.swisstopo.geologie-geologischer_atlas_profile).

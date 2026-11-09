@@ -1,7 +1,13 @@
-"""Small, testable helpers for the teaching notebook (swissALTI3D -> 25 m)."""
+"""Small, testable helpers for the teaching notebook.
+
+swissALTI3D -> 25 m terrain, plus the GA25 geological map and GA25 cross-sections.
+"""
 
 from contextlib import ExitStack
+import csv
 import hashlib
+from io import BytesIO
+import json
 import math
 from numbers import Real
 import os
@@ -41,6 +47,11 @@ EPSG = 2056
 CERVIN = (2_614_000, 1_089_000, 2_620_000, 1_095_000)
 CATALOG = "https://data.geo.admin.ch/api/stac/v1"
 COLLECTION = "ch.swisstopo.swissalti3d"
+WMS = "https://wms.geo.admin.ch/"
+IDENTIFY = "https://api3.geo.admin.ch/rest/services/api/MapServer/identify"
+GA25_MAP = "ch.swisstopo.geologie-geologischer_atlas"            # Geological Atlas 1:25 000
+GA25_SECTIONS = "ch.swisstopo.geologie-geologischer_atlas_profile"  # its cross-sections
+GEOLOGY_PIXEL = 5  # metres; divides the 25 m cells, so map and terrain share outer edges.
 
 
 def validate_aoi(aoi):
@@ -142,14 +153,19 @@ def valid_tile(path, checksum=None):
         return False
 
 
+def _session():
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
 def download_tiles(tiles, cache, progress=print):
     """Reuse validated files; publish a download only after it is complete."""
     cache = Path(cache)
     cache.mkdir(parents=True, exist_ok=True)
     paths = []
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    with requests.Session() as session:
-        session.mount("https://", HTTPAdapter(max_retries=retry))
+    with _session() as session:
         for index, tile in enumerate(tiles, 1):
             path = cache / tile["filename"]
             checksum = tile.get("checksum")
@@ -170,6 +186,116 @@ def download_tiles(tiles, cache, progress=print):
             paths.append(path)
             progress(f"Tile {index}/{len(tiles)} ready: {path.name}")
     return paths
+
+
+def get_ga25_map(aoi, pixel=GEOLOGY_PIXEL):
+    """Download the GA25 geological map as RGBA, on the terrain's exact outer edges.
+
+    Areas the atlas does not cover yet are transparent.
+    """
+    from PIL import Image
+
+    left, bottom, right, top = aligned_bounds(aoi)
+    width, height = round((right - left) / pixel), round((top - bottom) / pixel)
+    params = {"SERVICE": "WMS", "REQUEST": "GetMap", "VERSION": "1.3.0", "LAYERS": GA25_MAP,
+              "STYLES": "", "CRS": f"EPSG:{EPSG}", "BBOX": f"{left},{bottom},{right},{top}",
+              "WIDTH": width, "HEIGHT": height, "FORMAT": "image/png", "TRANSPARENT": "true"}
+    try:
+        with _session() as session:
+            response = session.get(WMS, params=params, timeout=(30, 180))
+            response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError("Cannot download the GA25 geological map. Check internet access and retry.") from exc
+    # The WMS reports errors as XML with status 200, so check the content type.
+    if not response.headers.get("Content-Type", "").startswith("image/png"):
+        raise RuntimeError("map.geo.admin.ch did not return an image: " + response.text[:300])
+    with Image.open(BytesIO(response.content)) as image:
+        rgba = np.asarray(image.convert("RGBA"))
+    if rgba.shape[:2] != (height, width):
+        raise RuntimeError("The GA25 map has an unexpected size. Retry later.")
+    return rgba, from_origin(left, top, pixel, pixel)
+
+
+def _section(feature):
+    """Keep what students need from one GA25 cross-section feature."""
+    p, geometry = feature["properties"], feature["geometry"]
+    lines = {"LineString": [geometry["coordinates"]],
+             "MultiLineString": geometry["coordinates"]}.get(geometry["type"])
+    url = urlparse(p.get("link_original") or "")
+    if (lines is None or not re.fullmatch(r"[A-Za-z0-9_.-]+", str(feature["id"]))
+            or url.scheme != "https" or url.hostname != "api3.geo.admin.ch"):
+        return None
+    return {"id": str(feature["id"]), "sheet": f"GA25 {p.get('ga25_no')} {p.get('ga25_name')}",
+            "plate": p.get("plate_no"), "section": p.get("section_no"),
+            "type": p.get("section_type_en"), "vert_exag": p.get("vert_exag"),
+            "author": p.get("author"), "edition": p.get("ga25_edition"), "url": url.geturl(),
+            "lines": [[(float(v[0]), float(v[1])) for v in line] for line in lines]}
+
+
+def find_sections(aoi, limit=200):
+    """GA25 cross-sections whose trace crosses the rectangle (may extend beyond it)."""
+    left, bottom, right, top = aligned_bounds(aoi)
+    params = {"geometryType": "esriGeometryEnvelope", "geometry": f"{left},{bottom},{right},{top}",
+              "layers": f"all:{GA25_SECTIONS}", "sr": EPSG, "tolerance": 0,
+              "returnGeometry": "true", "geometryFormat": "geojson", "lang": "fr", "limit": limit}
+    try:
+        with _session() as session:
+            response = session.get(IDENTIFY, params=params, timeout=(30, 120))
+            response.raise_for_status()
+            results = response.json()["results"]
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        raise RuntimeError("Cannot reach the GA25 sections service. Check internet access and retry.") from exc
+    if len(results) >= limit:
+        raise RuntimeError("Too many GA25 sections in this area. Reduce the study area.")
+    sections = {}
+    for feature in results:
+        section = _section(feature)
+        if section is not None:
+            sections[section["id"]] = section
+    return sorted(sections.values(), key=_section_order)
+
+
+def _section_order(section):
+    """Sheet, then plate (I, II, III...), then section number."""
+    roman = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10}
+    number = str(section["section"])
+    return (section["sheet"], roman.get(str(section["plate"]), 99),
+            int(number) if number.isdigit() else 0, section["id"])
+
+
+def valid_pdf(path):
+    """A complete PDF starts with %PDF and ends with an %%EOF marker."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    return data.startswith(b"%PDF") and b"%%EOF" in data[-2048:]
+
+
+def download_sections(sections, cache, progress=print):
+    """Download each section's original PDF plate once; adds a "path" to each section."""
+    cache = Path(cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    with _session() as session:
+        for index, section in enumerate(sections, 1):
+            path = cache / f"{section['id']}.pdf"
+            if not valid_pdf(path):
+                partial = path.with_suffix(".part")
+                try:
+                    with session.get(section["url"], stream=True, timeout=(30, 120)) as response:
+                        response.raise_for_status()
+                        with partial.open("wb") as stream:
+                            for chunk in response.iter_content(1024 * 1024):
+                                stream.write(chunk)
+                    if not valid_pdf(partial):
+                        raise ValueError("File is not a complete PDF.")
+                    partial.replace(path)
+                except (requests.RequestException, OSError, ValueError) as exc:
+                    partial.unlink(missing_ok=True)
+                    raise RuntimeError(f"Could not download {path.name}. Check network/disk space and rerun.") from exc
+            section["path"] = path
+            progress(f"Section {index}/{len(sections)} ready: {path.name}")
+    return sections
 
 
 def create_grid(paths, aoi):
@@ -231,8 +357,53 @@ def grid_info(dem, transform):
             "coverage_percent": float(valid.mean() * 100)}
 
 
-def export_outputs(dem, transform, output, tiles=()):
-    """Write ASCII, PNG, registration files, project notes and one download ZIP."""
+def _write_world(path, transform):
+    """World file: pixel size, rotation terms, then the upper-left pixel CENTRE."""
+    ul_x = transform.c + 0.5 * transform.a
+    ul_y = transform.f + 0.5 * transform.e
+    world = (transform.a, transform.d, transform.b, transform.e, ul_x, ul_y)
+    path.write_text("\n".join(f"{v:.10f}" for v in world) + "\n", encoding="ascii")
+
+
+def _corner_centres(transform, width, height):
+    lines = []
+    for label, col, row in [("Upper left", 0, 0), ("Upper right", width-1, 0),
+                            ("Lower left", 0, height-1), ("Lower right", width-1, height-1)]:
+        x = transform.c + (col + 0.5) * transform.a
+        y = transform.f + (row + 0.5) * transform.e
+        lines.append(f"{label}: pixel ({col}, {row}), X={x:.2f}, Y={y:.2f}")
+    return lines
+
+
+def _section_label(section):
+    return f"{section['plate']}-{section['section']}"
+
+
+def _write_sections(sections, csv_path, geojson_path):
+    """Section traces as CSV vertices (for GeoModeller) and GeoJSON (for GIS)."""
+    with csv_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["section_id", "label", "part", "vertex", "X", "Y"])
+        for s in sections:
+            for part, line in enumerate(s["lines"]):
+                for vertex, (x, y) in enumerate(line):
+                    writer.writerow([s["id"], _section_label(s), part, vertex, f"{x:.2f}", f"{y:.2f}"])
+    features = [{"type": "Feature", "id": s["id"],
+                 "properties": {k: s[k] for k in ("sheet", "plate", "section", "type", "vert_exag",
+                                                  "author", "edition", "url")},
+                 "geometry": {"type": "MultiLineString", "coordinates": s["lines"]}}
+                for s in sections]
+    geojson_path.write_text(json.dumps({"type": "FeatureCollection", "features": features,
+        "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::2056"}}}, indent=1),
+        encoding="utf-8")
+
+
+def export_outputs(dem, transform, output, tiles=(), geology=None, sections=()):
+    """Write ASCII, PNGs, registration files, sections, project notes and one download ZIP.
+
+    `geology` is the (rgba, transform) pair from get_ga25_map; `sections` the
+    list from find_sections / download_sections.
+    """
     import matplotlib.pyplot as plt
 
     info = grid_info(dem, transform)
@@ -250,51 +421,103 @@ def export_outputs(dem, transform, output, tiles=()):
     asc.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
     rgba = hillshade(dem, transform)
     plt.imsave(png, rgba, origin="upper")  # Raw pixels; no plot axes or margins.
-    ul_x = transform.c + 0.5 * transform.a
-    ul_y = transform.f + 0.5 * transform.e
-    world = (transform.a, transform.d, transform.b, transform.e, ul_x, ul_y)
-    png.with_suffix(".pgw").write_text("\n".join(f"{v:.10f}" for v in world) + "\n", encoding="ascii")
+    _write_world(png.with_suffix(".pgw"), transform)
     png.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+    files = [asc, asc.with_suffix(".prj"), png, png.with_suffix(".pgw"), png.with_suffix(".prj")]
+    if geology is not None:
+        geo_rgba, geo_transform = geology
+        geo_png = output / f"geology_ga25_{geo_transform.a:g}m_lv95.png"
+        plt.imsave(geo_png, geo_rgba, origin="upper")
+        _write_world(geo_png.with_suffix(".pgw"), geo_transform)
+        geo_png.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+        files += [geo_png, geo_png.with_suffix(".pgw"), geo_png.with_suffix(".prj")]
+    if sections:
+        traces = output / "sections_ga25_lv95.csv"
+        _write_sections(sections, traces, traces.with_suffix(".geojson"))
+        files += [traces, traces.with_suffix(".geojson")]
     lines = ["GeoModeller project: CH1903+ / LV95 (EPSG:2056), metres; heights LN02.",
              f"Grid: {width} columns x {height} rows, 25 m cells."]
     lines += [f"{key} = {info[key]:.2f}" for key in ("XMin", "XMax", "YMin", "YMax", "ZMin", "ZMax")]
     lines += [f"Terrain elevations: {info['elevation_min']:.2f} to {info['elevation_max']:.2f} m",
               f"Valid terrain coverage: {info['coverage_percent']:.1f}%",
               "Z limits include at least 100 m margin; lower ZMin for deeper geology.",
-              "X/Y bounds are image OUTER EDGES. PNG north is at the top.",
+              "X/Y bounds are image OUTER EDGES (same for every PNG). PNG north is at the top.",
               "For pixel control points, use these CENTRES (zero-based column,row):"]
-    for label, col, row in [("Upper left", 0, 0), ("Upper right", width-1, 0),
-                            ("Lower left", 0, height-1), ("Lower right", width-1, height-1)]:
-        x = transform.c + (col + 0.5) * transform.a
-        y = transform.f + (row + 0.5) * transform.e
-        lines.append(f"{label}: pixel ({col}, {row}), X={x:.2f}, Y={y:.2f}")
-    lines += ["Source: Federal Office of Topography swisstopo", "Source tile URLs:"]
+    lines += _corner_centres(transform, width, height)
+    if geology is not None:
+        geo_height, geo_width = geo_rgba.shape[:2]
+        lines += ["", f"GA25 geological map: {geo_png.name}, {geo_transform.a:g} m pixels.",
+                  "Transparent pixels: not covered by the Geological Atlas 1:25 000.",
+                  "Legend: click the map at https://map.geo.admin.ch/#/map?lang=fr"
+                  f"&center={(info['XMin'] + info['XMax']) / 2:.0f},{(info['YMin'] + info['YMax']) / 2:.0f}"
+                  f"&z=6&layers={GA25_MAP}",
+                  "Corner pixel CENTRES:"]
+        lines += _corner_centres(geo_transform, geo_width, geo_height)
+    if sections:
+        lines += ["", f"GA25 cross-sections crossing the area: {len(sections)}",
+                  "Traces (LV95 vertices): sections_ga25_lv95.csv / .geojson. They may extend",
+                  "beyond the area. Original plates: sections/<id>.pdf in the ZIP."]
+        for s in sections:
+            (x0, y0), (x1, y1) = s["lines"][0][0], s["lines"][-1][-1]
+            lines.append(f"{_section_label(s)}  {s['id']}  ({s['sheet']}, {s['edition']}; "
+                         f"vertical exaggeration {s['vert_exag']}; {s['author']})")
+            lines.append(f"    from X={x0:.1f}, Y={y0:.1f} to X={x1:.1f}, Y={y1:.1f}")
+    elif sections is not None and geology is not None:
+        lines += ["", "No GA25 cross-section crosses this area."]
+    lines += ["", "Source: Federal Office of Topography swisstopo", "Source tile URLs:"]
     lines += [tile["url"] for tile in tiles]
     notes.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    files.append(notes)
     # Include only files from this run, never an obsolete TIFF or arbitrary output files.
-    files = [asc, asc.with_suffix(".prj"), png, png.with_suffix(".pgw"), png.with_suffix(".prj"), notes]
     archive = output / "geomodeller_dem.zip"
     with ZipFile(archive, "w", ZIP_DEFLATED) as zipped:
         for path in files:
             zipped.write(path, path.name)
+        for s in sections:
+            if s.get("path"):
+                zipped.write(s["path"], f"sections/{s['id']}.pdf")
     return info, rgba, archive
 
 
-def preview(dem, rgba, transform):
-    """Show elevation and shading at equal map scale; exported PNG is untouched."""
+def preview(dem, rgba, transform, geology=None, sections=()):
+    """Show elevation, shading and GA25 geology with section traces; exports are untouched."""
+    from matplotlib import patheffects
     import matplotlib.pyplot as plt
 
     left, bottom, right, top = array_bounds(*dem.shape, transform)
     extent = (left, right, bottom, top)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+    panels = 3 if geology is not None or sections else 2
+    fig, axes = plt.subplots(1, panels, figsize=(6 * panels, 5), constrained_layout=True)
     terrain = axes[0].imshow(np.ma.masked_equal(dem, NODATA), extent=extent,
                              origin="upper", cmap="terrain", interpolation="nearest")
-    fig.colorbar(terrain, ax=axes[0], label="Elevation (m, LN02)")
+    fig.colorbar(terrain, ax=axes[0], label="Elevation (m, LN02)", shrink=0.8)
     axes[0].set_title("DEM: 25 m cells")
     axes[1].imshow(rgba, extent=extent, origin="upper", interpolation="nearest")
     axes[1].set_title("Hillshade: northwest light")
+    if panels == 3:
+        ax = axes[2]
+        ax.imshow(rgba, extent=extent, origin="upper", interpolation="nearest")
+        if geology is not None:
+            ax.imshow(geology[0], extent=extent, origin="upper", alpha=0.8)
+        for s in sections:
+            for line in s["lines"]:
+                xs, ys = zip(*line)
+                ax.plot(xs, ys, color="red", lw=1.5)
+            # Label at the first vertex inside the map, else the one nearest its centre.
+            vertices = [v for line in s["lines"] for v in line]
+            inside = [v for v in vertices if left <= v[0] <= right and bottom <= v[1] <= top]
+            cx, cy = (left + right) / 2, (bottom + top) / 2
+            x, y = inside[0] if inside else min(
+                vertices, key=lambda v: (v[0] - cx) ** 2 + (v[1] - cy) ** 2)
+            ax.annotate(_section_label(s), (np.clip(x, left, right), np.clip(y, bottom, top)),
+                        color="red", fontweight="bold",
+                        path_effects=[patheffects.withStroke(linewidth=3, foreground="white")])
+        ax.set_xlim(left, right)
+        ax.set_ylim(bottom, top)
+        ax.set_title(f"GA25 geology, {len(sections)} cross-section(s) in red")
     for ax in axes:
         ax.set_xlabel("LV95 easting (m)")
         ax.set_ylabel("LV95 northing (m)")
         ax.ticklabel_format(useOffset=False, style="plain")
+        ax.xaxis.set_major_locator(plt.MaxNLocator(4))
     plt.show()
