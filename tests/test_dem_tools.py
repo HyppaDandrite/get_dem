@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stdout
 import io
+import re
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -164,17 +165,16 @@ class DemTests(unittest.TestCase):
 
     def test_hillshade_lighting_and_gaps(self):
         rows, cols = np.indices((8, 8))
-        transform = from_origin(2614000, 1089200, 25, 25)
         dem = (2500 + cols * 25 - rows * 50).astype(float)
-        rgba = d.hillshade(dem, transform)
+        rgba = d.hillshade(dem)
         # z = x + 2*y: surface normal (-1,-2,1), NW sunlight (-0.5,0.5,sqrt(.5)).
         expected = max(0, (0.5 - 1 + np.sqrt(0.5)) / np.sqrt(6))
         np.testing.assert_allclose(rgba[:, :, 0], expected)
         np.testing.assert_equal(rgba[:, :, 3], 1)
-        flat = d.hillshade(np.full((8, 8), 2500), transform)
+        flat = d.hillshade(np.full((8, 8), 2500))
         np.testing.assert_allclose(flat[:, :, 0], np.sqrt(0.5))
         dem[3:5, 3:5] = d.NODATA
-        rgba = d.hillshade(dem, transform)
+        rgba = d.hillshade(dem)
         self.assertEqual(rgba[3, 3, 3], 0)
         self.assertEqual(rgba[2, 3, 3], 0)
         self.assertEqual(rgba[0, 0, 3], 1)
@@ -184,7 +184,7 @@ class DemTests(unittest.TestCase):
         dem[2:4, 2:4] = d.NODATA
         transform = from_origin(2614000, 1089200, 25, 25)
         (self.folder / "old.tif").write_text("old output")
-        info, rgba, archive = d.export_outputs(dem, transform, self.folder)
+        info, rgba, archive = d.export_outputs(dem, (2614000, 1089000, 2614200, 1089200), self.folder)
         with rasterio.open(self.folder / "dem_25m_lv95.asc") as src:
             np.testing.assert_allclose(src.read(1), dem, atol=0.001, rtol=0)
             self.assertEqual(src.transform, transform)
@@ -203,28 +203,180 @@ class DemTests(unittest.TestCase):
             self.assertFalse(any(name.endswith(".tif") for name in zipped.namelist()))
         self.assertFalse((self.folder / "dem_25m_lv95.tif").exists())
 
+    def test_invalid_rotated_areas(self):
+        good = (d.CERVIN_CENTER, 6000, 30)
+        cases = [(None, 6000, 0), ((2617000,), 6000, 0), ((2617000, "1092000"), 6000, 0),
+                 ((2617000, float("nan")), 6000, 0), ((7.6, 46.0), 6000, 0),
+                 (d.CERVIN_CENTER, 99, 0), (d.CERVIN_CENTER, 10001, 0),
+                 (d.CERVIN_CENTER, (6000, 50), 0), (d.CERVIN_CENTER, (1, 2, 3), 0),
+                 (d.CERVIN_CENTER, True, 0), (d.CERVIN_CENTER, 6000, float("inf")),
+                 (d.CERVIN_CENTER, 6000, "north"),
+                 # Fits north-up, but its rotated corners leave the LV95 range.
+                 ((2_404_000, 1_200_000), 8000, 45)]
+        d.make_area(*good)
+        for args in cases:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                d.make_area(*args)
+
+    def test_area_geometry(self):
+        area = d.make_area(d.CERVIN_CENTER, (1010, 490), -330)
+        self.assertEqual((area.width, area.height, area.azimuth), (1025, 500, 30))
+        self.assertTrue(d.make_area(d.CERVIN_CENTER, 6000, 360).north_up)
+        corners = area.corners()
+        # The top edge faces N30E, so walking along it from upper left to upper right heads N120E.
+        (x1, y1), (x2, y2) = corners["upper left"], corners["upper right"]
+        self.assertAlmostEqual(np.degrees(np.arctan2(x2 - x1, y2 - y1)) % 360, 120)
+        self.assertAlmostEqual(np.hypot(x2 - x1, y2 - y1), 1025)
+        np.testing.assert_allclose(np.mean(list(corners.values()), axis=0), d.CERVIN_CENTER)
+        u, v = area.to_local(*corners["upper right"])
+        np.testing.assert_allclose((u, v), (1025, 500), atol=1e-6)
+        np.testing.assert_allclose(area.to_lv95(*area.to_local(2617100, 1092200)),
+                                   (2617100, 1092200))
+        # The pixel transform maps the outer pixel corners onto the area corners.
+        t = area.transform(25)
+        np.testing.assert_allclose(d.apply(t, 0, 0), corners["upper left"])
+        np.testing.assert_allclose(d.apply(t, 41, 20), corners["lower right"])
+        north = d.make_area(d.CERVIN_CENTER, 6000)
+        self.assertEqual(north.transform(25), from_origin(2614000, 1095000, 25, 25))
+        self.assertEqual(north.envelope(), d.CERVIN)
+        self.assertEqual(d.area_from_bounds(d.CERVIN), north)
+
+    def plane_tile(self, width=600):
+        rows, cols = np.indices((width, width))
+        x, y = 2614000 + 2 * cols + 1, 1090200 - 2 * rows - 1
+        return self.tile("plane.tif", data=(x - 2614000) + 2 * (y - 1089000), top=1090200)
+
+    def test_rotated_grid_averages_a_plane_exactly(self):
+        path = self.plane_tile()  # z = (x - x0) + 2 (y - y0) over 1.2 x 1.2 km.
+        area = d.make_area((2614600, 1089600), 600, 30)
+        dem, transform = d.create_grid([path], area)
+        self.assertEqual(dem.shape, (24, 24))
+        self.assertEqual(transform, from_origin(0, 600, 25, 25))
+        col, row = np.meshgrid(np.arange(24) + 0.5, np.arange(24) + 0.5)
+        x, y = d.apply(area.transform(25), col, row)
+        # 1 m sub-samples approximate the oblique cell edges: within 0.15 m on this 66 degree slope.
+        np.testing.assert_allclose(dem, (x - 2614000) + 2 * (y - 1089000), atol=0.15)
+
+    def test_quarter_turn_matches_north_up_grid(self):
+        path = self.plane_tile()
+        data = np.random.default_rng(1).normal(2500, 300, (600, 600))
+        with rasterio.open(path, "r+") as dst:
+            dst.write(data.astype("float32"), 1)
+        north, _ = d.create_grid([path], d.make_area((2614600, 1089600), 500, 0))
+        east, _ = d.create_grid([path], d.make_area((2614600, 1089600), 500, 90))
+        np.testing.assert_allclose(np.rot90(north), east, atol=1e-3)
+        np.testing.assert_allclose(np.rot90(d.hillshade(north)), d.hillshade(east, 90), atol=1e-9)
+
+    def test_hillshade_lighting_independent_of_rotation(self):
+        # Same LV95 plane (z rises northwards); the shade must not depend on the grid turn.
+        for azimuth in [0, 30, 90, 200]:
+            area = d.make_area(d.CERVIN_CENTER, 200, azimuth)
+            col, row = np.meshgrid(np.arange(8) + 0.5, np.arange(8) + 0.5)
+            _, y = d.apply(area.transform(25), col, row)
+            rgba = d.hillshade(y * 0.5, azimuth)
+            expected = (-0.5 * np.cos(np.radians(315)) * np.cos(np.radians(45))
+                        + np.sin(np.radians(45))) / np.sqrt(1.25)
+            with self.subTest(azimuth=azimuth):
+                np.testing.assert_allclose(rgba[:, :, 0], expected)
+
+    def fake_wms(self, params):
+        # Colour encodes the LV95 pixel position, to check where each pixel came from.
+        self.assertEqual(params["CRS"], "EPSG:2056")
+        height, width = int(params["HEIGHT"]), int(params["WIDTH"])
+        image = np.zeros((height, width, 4), dtype=np.uint8)
+        image[..., 0] = np.arange(width)[None, :] % 256
+        image[..., 1] = np.arange(height)[:, None] % 256
+        image[..., 3] = 255
+        return image
+
+    def test_geology_north_up_and_rotated(self):
+        self.assertIsNone(d.get_geology(d.CERVIN, None))
+        with self.assertRaisesRegex(ValueError, "GEOLOGY"):
+            d.get_geology(d.CERVIN, "geology")
+        with self.assertRaisesRegex(ValueError, "divide"):
+            d.get_geology(d.CERVIN, "geocover", pixel=7)
+        with patch.object(d, "_fetch_png", side_effect=self.fake_wms) as fetch:
+            north = d.get_geology(d.make_area(d.CERVIN_CENTER, 1000), "atlas")
+            params = fetch.call_args.args[0]
+            self.assertEqual(params["LAYERS"], "ch.swisstopo.geologie-geologischer_atlas")
+            self.assertEqual(params["BBOX"], "2616500,1091500,2617500,1092500")
+            np.testing.assert_array_equal(north["rgba"], north["source"])
+            area = d.make_area(d.CERVIN_CENTER, 1000, 45)
+            turned = d.get_geology(area, "geocover")
+        self.assertEqual(turned["rgba"].shape, (200, 200, 4))
+        self.assertTrue((turned["rgba"][..., 3] == 255).all())
+        # Upper-left output pixel comes from the source pixel under its LV95 centre.
+        x, y = d.apply(area.transform(5), 0.5, 0.5)
+        col, row = d.apply(~turned["source_transform"], x, y)
+        np.testing.assert_array_equal(turned["rgba"][0, 0, :2], [int(col) % 256, int(row) % 256])
+
+    def test_geology_service_errors(self):
+        response = SimpleNamespace(headers={"Content-Type": "text/xml"}, text="<ServiceException/>",
+                                   raise_for_status=lambda: None)
+        with patch.object(d.requests, "Session") as session:
+            session.return_value.__enter__.return_value.get.return_value = response
+            with self.assertRaisesRegex(RuntimeError, "did not return an image"):
+                d.get_geology(d.make_area(d.CERVIN_CENTER, 1000), "geocover")
+            session.return_value.__enter__.return_value.get.side_effect = d.requests.ConnectionError()
+            with self.assertRaisesRegex(RuntimeError, "Cannot download the geological map"):
+                d.get_geology(d.make_area(d.CERVIN_CENTER, 1000), "geocover")
+
+    def test_rotated_export_uses_local_frame(self):
+        area = d.make_area(d.CERVIN_CENTER, 200, 30)
+        dem = np.arange(64, dtype="float32").reshape(8, 8) + 2500
+        with patch.object(d, "_fetch_png", side_effect=self.fake_wms):
+            geology = d.get_geology(area, "geocover")
+        info, rgba, archive = d.export_outputs(dem, area, self.folder, geology=geology)
+        self.assertEqual((info["XMin"], info["XMax"], info["YMin"], info["YMax"]), (0, 200, 0, 200))
+        with rasterio.open(self.folder / "dem_25m_local.asc") as src:
+            np.testing.assert_allclose(src.read(1), dem)
+            self.assertIsNone(src.crs)
+        world = list(map(float, (self.folder / "geology_5m_local.pgw").read_text().splitlines()))
+        self.assertEqual(world, [5, 0, 0, -5, 2.5, 197.5])
+        self.assertEqual(plt.imread(self.folder / "geology_5m_local.png").shape, (40, 40, 4))
+        with ZipFile(archive) as zipped:
+            names = set(zipped.namelist())
+        self.assertEqual(names, {"dem_25m_local.asc", "hillshade_25m_local.png",
+                                 "hillshade_25m_local.pgw", "geology_5m_local.png",
+                                 "geology_5m_local.pgw", "project_info.txt"})
+        notes = (self.folder / "project_info.txt").read_text()
+        self.assertIn("azimuth 30 degrees", notes)
+        self.assertIn("ch.swisstopo.geologie-geocover", notes)
+        # The written formula maps the LV95 upper-right corner onto local (200, 200).
+        formula = next(line for line in notes.splitlines() if line.strip().startswith("X = ("))
+        x0, c, y0, s = map(float, re.findall(r"[-\d.]+(?=\))|(?<=\* )[-\d.]+", formula))
+        e, n = area.corners()["upper right"]
+        self.assertAlmostEqual((e - x0) * c - (n - y0) * s, 200, places=3)
+
     def test_notebook_structure_and_offline_execution(self):
         notebook = nbformat.read(ROOT / "notebooks/get_dem_25m.ipynb", as_version=4)
         nbformat.validate(notebook)
         codes = [c.source for c in notebook.cells if c.cell_type == "code"]
-        self.assertEqual(sum("AOI_LV95 =" in s for s in codes), 1)
+        for name in ["CENTER_LV95 =", "SIDE_M =", "AZIMUTH_DEG =", "GEOLOGY ="]:
+            self.assertEqual(sum(name in s for s in codes), 1)
         for c in notebook.cells:
             if c.cell_type == "code":
                 self.assertEqual(c.outputs, [])
                 compile(c.source, "notebook", "exec")
         path = self.tile()
-        ns = {}
-        with redirect_stdout(io.StringIO()), patch.object(plt, "show"):
-            exec(codes[0], ns)
-            self.assertEqual(ns["AOI_LV95"], d.CERVIN)
-            ns["AOI_LV95"] = (2614000, 1089000, 2614200, 1089200)
-            exec(codes[1], ns)
-            ns["OUTPUT"] = self.folder
-            ns["find_tiles"] = lambda _: [{"url": "synthetic test"}]
-            ns["download_tiles"] = lambda *_: [path]
-            for source in codes[2:]:
-                exec(source, ns)
-            self.assertTrue(ns["archive"].exists())
+        for azimuth in [0, 30]:
+            ns = {}
+            with self.subTest(azimuth=azimuth), redirect_stdout(io.StringIO()), \
+                    patch.object(plt, "show"), patch.object(d, "_fetch_png", side_effect=self.fake_wms):
+                exec(codes[0], ns)
+                self.assertEqual(d.make_area(ns["CENTER_LV95"], ns["SIDE_M"], ns["AZIMUTH_DEG"]).envelope(),
+                                 d.CERVIN)
+                self.assertEqual(ns["GEOLOGY"], "geocover")
+                ns.update(CENTER_LV95=(2614100, 1089100), SIDE_M=200, AZIMUTH_DEG=azimuth)
+                exec(codes[1], ns)
+                ns["OUTPUT"] = self.folder / str(azimuth)
+                ns["find_tiles"] = lambda _: [{"url": "synthetic test"}]
+                ns["download_tiles"] = lambda *_: [path]
+                for source in codes[2:]:
+                    exec(source, ns)
+                self.assertTrue(ns["archive"].exists())
+                frame = "lv95" if azimuth == 0 else "local"
+                self.assertTrue((ns["OUTPUT"] / f"geology_5m_{frame}.png").exists())
 
 
 if __name__ == "__main__":
